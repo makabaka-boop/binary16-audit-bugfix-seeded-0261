@@ -44,7 +44,7 @@ func (r *Result) RoundedDecimal() string {
 	if r.class == ClassZero && r.bits&0x8000 != 0 {
 		return "-0"
 	}
-	return r.rounded.FloatString(3)
+	return ratToTerminatingDecimal(r.rounded)
 }
 
 // ErrorFraction returns (numerator, denominator) of rounded-original in
@@ -79,9 +79,9 @@ func Convert(s string) *Result {
 	mag := new(big.Rat).Abs(x)
 	k := floorLog2Rat(mag) // mag in [2^k, 2^(k+1))
 
-	// |x| >= 2^16: all such magnitudes (including the midpoint between
-	// 65504 and infinity, 65520 = 2^16 - 2^4) round to infinity; 65520
-	// itself is the tie point and infinity's significand is even.
+	// Values at or above 2^16 are beyond the tie between 65504 and infinity
+	// (65520 = 2^16 - 2^4), so they round to infinity. The tie itself is
+	// handled in the k == 15 normal grid below.
 	if k >= 16 {
 		return infResult(d.negative)
 	}
@@ -91,11 +91,12 @@ func Convert(s string) *Result {
 	var class Class
 
 	if k <= -15 {
-		// Subnormal grid: spacing 2^-24; significand m in [0, 2048].
+		// Subnormal grid: spacing 2^-24; significand m in [0, 1024].
 		scaled := new(big.Rat).Mul(mag, ratPow2(24))
-		m := roundEven(scaled) // 0..1024; m == 0 handled below
-		if m.Cmp(big.NewInt(1024)) > 0 {
-			// Tie/carry exactly onto the smallest normal 2^-14 = 1024*2^-24.
+		m := roundEven(scaled) // 0 means a signed zero below
+		if m.Cmp(big.NewInt(1024)) >= 0 {
+			// A tie at 1023.5 rounds to even 1024; higher values also carry
+			// onto the smallest normal 2^-14 = 1024*2^-24.
 			bits = 0x0400
 			rounded = ratPow2(-14)
 			class = ClassNormal
@@ -112,9 +113,6 @@ func Convert(s string) *Result {
 		}
 	} else {
 		// Normal binade: spacing 2^(k-10); significand m in [1024,2048).
-		if k == 15 && mag.Cmp(big.NewRat(65512, 1)) >= 0 {
-			return infResult(d.negative)
-		}
 		scaled := new(big.Rat).Mul(mag, ratPow2(10-k))
 		m := roundEven(scaled)
 		if m.Cmp(big.NewInt(2048)) >= 0 {
@@ -171,7 +169,7 @@ func roundEven(r *big.Rat) *big.Int {
 	if cmp > 0 {
 		return q.Add(q, big.NewInt(1))
 	}
-	if q.Bit(0) == 0 { // exact tie
+	if q.Bit(0) != 0 { // exact tie: choose the even integer
 		q.Add(q, big.NewInt(1))
 	}
 	return q

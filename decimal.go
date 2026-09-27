@@ -39,9 +39,9 @@ func parseError() *Result { return &Result{reject: true} }
 //
 //	sign * coeff * 10^exp
 //
-// where coeff holds the decimal digits with leading zeros removed (so
-// len(coeff) is the significant-digit count). exp is the decimal exponent
-// of the least significant digit.
+// where coeff holds the significant decimal digits with leading and trailing
+// zeros removed (so len(coeff) is the significant-digit count). exp is the
+// decimal exponent of the least significant digit.
 type decimal struct {
 	negative bool
 	coeff    *big.Int
@@ -52,7 +52,7 @@ type decimal struct {
 //
 // Accepted grammar (no whitespace, no NaN, no Infinity):
 //
-//	[+-]? ( [0-9]+ ('.' [0-9]*)? | '.' [0-9]+ ) ( [eE] [+-]? [0-9]+ )?
+//	[+-]? ( [0-9]+ ('.' [0-9]*)? | '.' [0-9]+ ) ( [eE] [+-]? [0-9]{1,2} )?
 //
 // The number of significant digits must not exceed 30 and the decimal
 // exponent of the leading significant digit must be in [-50, 50].
@@ -98,75 +98,69 @@ func ParseDecimal(s string) (decimal, bool) {
 		}
 	}
 
-	exp := 0
-	if rawExp != "" {
-		e := rawExp
-		eneg := false
-		if len(e) > 0 && (e[0] == '+' || e[0] == '-') {
-			eneg = e[0] == '-'
-			e = e[1:]
-		}
-		if e == "" || len(e) > 1 {
-			return decimal{}, false
-		}
-		for _, c := range e {
-			if c < '0' || c > '9' {
-				return decimal{}, false
-			}
-			exp = exp*10 + int(c-'0')
-		}
-		if eneg {
-			exp = -exp
-		}
-	}
-
-	digits := intPart + fracPart
-	// fracDigits is the exponent attached to the last digit of digits
-	// before stripping leading zeros.
-	fracDigits := len(fracPart)
-	t := strings.TrimLeft(digits, "0")
-	if t == "" {
-		// Signed zero of any shape is accepted with value zero.
-		return decimal{negative: negative, coeff: new(big.Int), exp: 0}, true
-	}
-	if len(t) > MaxSigDigits {
-		return decimal{}, false
-	}
-	coeff, ok := new(big.Int).SetString(t, 10)
+	exp, ok := parseExponent(rawExp)
 	if !ok {
 		return decimal{}, false
 	}
-	// The last character of digits (the last fractional digit when a
-	// decimal point is present) has weight 10^(E-fracDigits). Stripping
-	// leading zeros does not change that weight; stripping trailing zeros
-	// is handled by normalizeCoeff.
-	exp -= fracDigits
-	coeff, exp = normalizeCoeff(coeff, exp)
+
+	digits := intPart + fracPart
+	withoutLeading := strings.TrimLeft(digits, "0")
+	// Significant digits exclude both leading zeros and trailing zeros, so
+	// "0.0012300" has the same three significant digits as "123".
+	significant := strings.TrimRight(withoutLeading, "0")
+	if significant == "" {
+		// Signed zero of any shape is accepted with value zero. The explicit
+		// exponent still has to satisfy its own bound.
+		return decimal{negative: negative, coeff: new(big.Int), exp: 0}, true
+	}
+	if len(significant) > MaxSigDigits {
+		return decimal{}, false
+	}
+	coeff, ok := new(big.Int).SetString(significant, 10)
+	if !ok {
+		return decimal{}, false
+	}
+
+	// Before stripping, the last digit has weight 10^(exp-fracDigits). Each
+	// removed trailing zero moves the retained last digit up one exponent.
+	exp += len(withoutLeading) - len(significant) - len(fracPart)
 
 	// Decimal exponent of the leading significant digit.
-	leadExp := exp + len(coeff.String()) - 1
-	if leadExp > MaxDecExp {
+	leadExp := exp + len(significant) - 1
+	if leadExp < MinDecExp || leadExp > MaxDecExp {
 		return decimal{}, false
 	}
 	return decimal{negative: negative, coeff: coeff, exp: exp}, true
 }
 
-// normalizeCoeff removes trailing zeros of c, adjusting exp so that the
-// represented value is unchanged. This keeps the significant-digit count
-// exact ("1000" counts one significant digit).
-func normalizeCoeff(c *big.Int, exp int) (*big.Int, int) {
-	ten := big.NewInt(10)
-	zero := new(big.Int)
-	mod := new(big.Int)
-	for c.Sign() != 0 {
-		mod.Mod(c, ten)
-		if mod.Cmp(zero) != 0 {
-			break
-		}
-		c.Quo(c, ten)
-		exp++
+// parseExponent parses [+-]? [0-9]{1,2} and enforces the explicit exponent
+// bound.
+func parseExponent(s string) (int, bool) {
+	if s == "" {
+		return 0, true
 	}
-	return c, exp
+	negative := false
+	if s[0] == '+' || s[0] == '-' {
+		negative = s[0] == '-'
+		s = s[1:]
+	}
+	if len(s) < 1 || len(s) > 2 {
+		return 0, false
+	}
+	exp := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		exp = exp*10 + int(c-'0')
+	}
+	if negative {
+		exp = -exp
+	}
+	if exp < MinDecExp || exp > MaxDecExp {
+		return 0, false
+	}
+	return exp, true
 }
 
 // Rat returns sign * coeff * 10^exp exactly.

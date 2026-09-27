@@ -83,7 +83,7 @@ func padBits(b uint16) string {
 	const digits = "01"
 	out := make([]byte, 16)
 	for i := 15; i >= 0; i-- {
-		out[15-i] = digits[b&1]
+		out[i] = digits[b&1]
 		b >>= 1
 	}
 	return string(out)

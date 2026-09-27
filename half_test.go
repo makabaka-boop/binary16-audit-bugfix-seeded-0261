@@ -261,7 +261,14 @@ func TestOverflowAndInfinity(t *testing.T) {
 	}
 	wantBits(t, "-65520", 0xfc00, ClassInfinity)
 
-	// Just below the tie goes to the largest finite; above goes to inf.
+	// Values above the premature 65512 cutoff but below the overflow tie
+	// must still encode as finite half values.
+	wantBits(t, "65512", 0x7bff, ClassNormal)
+	wantBits(t, "65515", 0x7bff, ClassNormal)
+
+	// The actual finite/infinity tie is 65520; values immediately below it
+	// remain finite.
+	wantBits(t, "65516", 0x7bff, ClassNormal)
 	wantBits(t, "65519.9921875", 0x7bff, ClassNormal)
 	wantBits(t, "65520.0078125", 0x7c00, ClassInfinity)
 
@@ -271,15 +278,19 @@ func TestOverflowAndInfinity(t *testing.T) {
 }
 
 func TestRejectedInputs(t *testing.T) {
+	core30 := strings.Repeat("1234567890", 2) + "1234567891"
 	bad := []string{
 		"", "  ", " 1", "1 ", "1\n",
 		"NaN", "+NaN", "nan", "Infinity", "-Infinity", "inf", "Inf",
 		"1e", "e3", "+-1", "1.2.3", "0x1", "1e3x", "1.5e", ".", "..",
 		"1..2", ".1.2", "1_000", "1,0", "1e03x", "0x1p4", "true",
-		"1e+99", "1e51", "1e-51", "1000000000000000000000000000000000000000000000000000000000000", // 10^60, decimal exponent 60
+		"1e+99", "1e51", "1e-51", "0e51", "-0e-51",
+		"1" + strings.Repeat("0", 51), // ordinary decimal 10^51
+		"1000000000000000000000000000000000000000000000000000000000000", // 10^60, decimal exponent 60
 	}
-	bad = append(bad, "0."+strings.Repeat("0", 50)+"1")  // leading digit at 10^-51
+	bad = append(bad, "0."+strings.Repeat("0", 50)+"1") // leading digit at 10^-51
 	bad = append(bad, "1234567890123456789012345678901") // 31 significant digits
+	bad = append(bad, "1234567890123456789012345678901000") // 31 significant digits plus trailing zeros
 	for _, s := range bad {
 		if r := Convert(s); !r.Reject() {
 			t.Fatalf("input %q should have been rejected, got %04x", s, r.Bits())
@@ -287,7 +298,10 @@ func TestRejectedInputs(t *testing.T) {
 	}
 
 	good := []string{
-		"1.", ".5", "+.5e2", "1e-50", "-1e-50", "1e50", "1E+0", "00007",
+		"1.", ".5", "+.5e2", "1e-50", "-1e-50", "1e50", "1E+0", "1.25e10",
+		"0." + strings.Repeat("0", 49) + "10", // trailing zero does not change length or exponent
+		core30 + strings.Repeat("0", 10),
+		"00007",
 		"0." + strings.Repeat("0", 49) + "1", // 10^-50, exactly at the limit
 		"123456789012345678901234567890",     // 30 significant digits
 		"100000000000000000000000000000",     // one sig digit + trailing zeros (exp 29)
@@ -295,6 +309,50 @@ func TestRejectedInputs(t *testing.T) {
 	for _, s := range good {
 		if r := Convert(s); r.Reject() {
 			t.Fatalf("input %q should be accepted", s)
+		}
+	}
+}
+
+func TestBitStringMatchesHex(t *testing.T) {
+	for _, s := range []string{"0", "-0", "0.1", "1", "-1", "65504", "65520"} {
+		r := Convert(s)
+		if r.Reject() {
+			t.Fatalf("input %q rejected", s)
+		}
+		fromHex, err := strconv.ParseUint(r.Hex(), 16, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fromBits, err := strconv.ParseUint(padBits(r.Bits()), 2, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uint16(fromHex) != r.Bits() || uint16(fromBits) != r.Bits() {
+			t.Fatalf("input %q: hex %q and bits %q disagree with %04x", s, r.Hex(), padBits(r.Bits()), r.Bits())
+		}
+	}
+}
+
+func TestParseDecimalNormalization(t *testing.T) {
+	core30 := strings.Repeat("1234567890", 2) + "1234567891"
+	cases := []struct {
+		input string
+		coeff string
+		exp   int
+	}{
+		{"0.0012300", "123", -6},
+		{"12300", "123", 2},
+		{"1.25e10", "125", 8},
+		{"0." + strings.Repeat("0", 49) + "10", "1", -50},
+		{core30 + strings.Repeat("0", 10), core30, 10},
+	}
+	for _, tc := range cases {
+		d, ok := ParseDecimal(tc.input)
+		if !ok {
+			t.Fatalf("ParseDecimal(%q) rejected", tc.input)
+		}
+		if d.coeff.String() != tc.coeff || d.exp != tc.exp {
+			t.Fatalf("ParseDecimal(%q) = %s*10^%d, want %s*10^%d", tc.input, d.coeff, d.exp, tc.coeff, tc.exp)
 		}
 	}
 }
@@ -329,6 +387,15 @@ func TestBatch(t *testing.T) {
 	}
 	if resp.Results[0].Hex == nil || *resp.Results[0].Hex != "2e66" {
 		t.Fatalf("first result = %+v", resp.Results[0])
+	}
+	if resp.Results[0].Bits == nil || *resp.Results[0].Bits != "0b0010111001100110" {
+		t.Fatalf("first result bits = %v", *resp.Results[0].Bits)
+	}
+	if resp.Results[0].Rounded == nil || *resp.Results[0].Rounded != "0.0999755859375" {
+		t.Fatalf("first result rounded = %v", resp.Results[0].Rounded)
+	}
+	if resp.Results[0].Delta == nil || resp.Results[0].Delta.Num != "-1" || resp.Results[0].Delta.Den != "40960" {
+		t.Fatalf("first result delta = %+v", resp.Results[0].Delta)
 	}
 	if resp.Results[1].OK || resp.Results[1].Error == nil {
 		t.Fatalf("NaN must be a rejected item: %+v", resp.Results[1])
